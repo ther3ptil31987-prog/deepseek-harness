@@ -25,6 +25,8 @@ English | [中文](README.zh.md)
 <a id="use-this-package"></a>
 ## Use this package
 
+New commands start in the Session's current working directory. Relative `workdir` values resolve from that directory; per-call overrides and background jobs do not change it.
+
 Load this plugin in any composition where the agent should run bash commands: it registers the `bash` tool once an executor provider and the `dsh-shell-env` registry are mounted, and stays pending until the `tools`, `shell`, `systemPrompt`, and `shellEnv` services exist.
 
 ### Minimal configuration
@@ -61,7 +63,7 @@ Passing `run_in_background: true` admits a job and returns its id immediately; c
 
 ### Foreground commands as jobs
 
-With a job registry composed, a foreground command is registered with `ctx.jobs` at its start and the call waits on that job: the command is listed, streams through `job.list` and `job.follow`, and can be stopped from the Web task list for as long as it runs. A command that finishes within the timeout returns the ordinary foreground result and its job record leaves the registry with it, so the model never sees an id. A command that outlives the timeout keeps running as the job it already was, and the call returns `[still running after <timeoutMs>ms; moved to background job <id>]` plus the job hand-off guidance, seeded with one consuming read of the output so far — `job_output` continues exactly after it. A kill from outside the call (the human stopping the job) settles the foreground result with `[stopped: <reason>]` ahead of the signal marker, so the model reads the reason instead of a command failure; cancelling the call itself kills the job. Registration is best-effort: `promoteOnTimeout: false`, a missing job registry, or a registry that refuses the job at its start (the owner's job limit, no controller) run the command under the executor's deadline kill instead, and the `timeoutMs` parameter description advertises the hand-over only when it holds.
+With a job registry composed, a foreground command is registered with `ctx.jobs` at its start and the call waits on that job: the command is listed, streams through `job.list` and `job.follow`, and can be stopped from the Web task list for as long as it runs. A command that finishes within the timeout returns the ordinary foreground result and its job record leaves the registry with it, so the model never sees an id. A command that outlives the timeout keeps running as the job it already was, and the call returns `[still running after <timeoutMs>ms; moved to background job <id>]`, seeded with one consuming read of the output so far — `job_output` continues exactly after it. A kill from outside the call (the human stopping the job) settles the foreground result with `[stopped: <reason>]` ahead of the signal marker, so the model reads the reason instead of a command failure; cancelling the call itself kills the job. Registration is best-effort: `promoteOnTimeout: false`, a missing job registry, or a registry that refuses the job at its start (the owner's job limit, no controller) run the command under the executor's deadline kill instead, and the `timeoutMs` parameter description advertises the hand-over only when it holds.
 
 ### Sandboxed execution and escalation
 
@@ -69,7 +71,7 @@ When the mounted executor confines commands (for example `dsh-bash-sandbox`), a 
 
 ### What can go wrong
 
-A composition with no executor provider never activates the tool. Background calls without the job runtime fail with `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, and `sandbox_permissions` without a sandboxing executor fails with `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`. `enableRunInBackground: false` removes the parameter and rejects a forced background call at execution time.
+A composition with no executor provider never activates the tool. Background calls without the job runtime fail with `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, and `sandbox_permissions` or `justification` without a sandboxing executor fails with `invalid arguments: sandbox_permissions and justification are not available in this composition (no sandboxing executor to escalate)`. `enableRunInBackground: false` removes the parameter and rejects a forced background call at execution time.
 
 -----
 
@@ -78,6 +80,8 @@ A composition with no executor provider never activates the tool. Background cal
 
 <details>
 <summary>Implementation internals — click to expand</summary>
+
+Structured foreground and background results expose `cwd`, the executor-resolved launch directory. Persisted presentation metadata carries the same value so settled cards retain the directory used by that call. A command’s own `cd` does not change this launch value; native result text remains stdout, stderr, and status markers.
 
 This section explains the design decisions behind the tool and points at the code that realizes them; the observable behavior is fully covered in [Use this package](#use-this-package).
 
@@ -98,7 +102,7 @@ This section explains the design decisions behind the tool and points at the cod
 
 ### Request resolution
 
-The tool resolves the workdir before `ctx.shell.resolve()` runs: an explicit relative `workdir` is resolved against the session cwd, and a sandbox policy's canonical workspace root wins so confinement and launch use the same identity. Sandbox policy resolves per call through `ctx.sandboxPolicy`; an escalation request goes through `ctx.approval` before anything executes, and the tool fails at load if the executor confines but no policy service is mounted.
+The tool resolves the workdir before `ctx.shell.resolve()` runs: an explicit relative `workdir` is resolved against the Session's current directory, independently of the sandbox permission root. Sandbox policy resolves per call through `ctx.sandboxPolicy`; an escalation request goes through `ctx.approval` before anything executes, and the tool fails at load if the executor confines but no policy service is mounted.
 
 ### Rendering story
 
@@ -192,7 +196,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Validation and policy failures are normalized as `Error: <message>`. This package's stable messages are `invalid command: expected a non-empty string`, `invalid description: expected a non-empty string`, `invalid timeoutMs: expected a positive number, got <value>`, the escalation pairing failures, `run_in_background is disabled for this deployment (enableRunInBackground: false)`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`, the approval availability/rejection/cancellation variants, and `tool call aborted`.
+Validation and policy failures are normalized as `Error: <message>`. This package's stable messages are `invalid arguments: invalid command: expected a non-empty string`, `invalid arguments: invalid description: expected a non-empty string`, `invalid arguments: invalid timeoutMs: expected a positive number, got <value>`, the escalation pairing failures, `invalid arguments: run_in_background is disabled for this deployment (enableRunInBackground: false)`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, `invalid arguments: sandbox_permissions and justification are not available in this composition (no sandboxing executor to escalate)`, the approval availability/rejection/cancellation variants, and `tool call aborted`. Each failure also records `error.name` and `error.code` on `tool/result`: argument violations, including `sandbox_permissions`, `justification`, or `run_in_background` when the schema does not advertise them, are `ToolArgsError` (`INVALID_ARGS`, message prefix `invalid arguments: `), escalation failures are `SandboxEscalationError` (`SANDBOX_ESCALATION_INVALID_ARGUMENT`, `_UNAVAILABLE`, `_REJECTED`, `_CANCELLED`), a missing job runtime is `ToolContextUnavailableError` (`TOOL_CONTEXT_UNAVAILABLE`), and cancellation is `AbortError` (`ABORTED`). A launch or preparation failure keeps the class and code it was thrown with, such as `SandboxUnavailableError` or `SandboxPreparationError`, whether the call waited on a job or not; a platform spawn error, recognized by its errno `code`, becomes `SubprocessError` (`SUBPROCESS_SPAWN_NOT_FOUND` for `ENOENT`, otherwise `SUBPROCESS_SPAWN_FAILED`), even when it settles after the call was cancelled.
 
 #### Token effect
 

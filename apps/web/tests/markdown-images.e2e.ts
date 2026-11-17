@@ -10,7 +10,7 @@ import { createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   SESSION_FORMAT_VERSION,
   Session,
-  SessionId,
+  type SessionId,
 } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-title'
 import {
@@ -24,6 +24,7 @@ import {
   type WebScaffold,
 } from './scaffold.ts'
 import { newEnglishPage, pinBrowserClock, saveFailureShot, WEB_FIXTURE_TIME } from './support.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('./expected/markdown-images', import.meta.url))
 const UI_EXPECTED = fileURLToPath(new URL('./expected/markdown-images/ui.expected.md', import.meta.url))
@@ -82,7 +83,7 @@ async function stopServer(server: Server): Promise<void> {
 
 /** Build one closed session fixture with remote and local image Markdown. */
 function markdownImageFixture(remoteUrl: string, outsidePath: string): string {
-  const session = Session.create(SessionId('markdown-image-source'))
+  const session = Session.create(brandString<SessionId>('markdown-image-source'))
   const eventTimeOrigin = new Date().setHours(12, 0, 0, 0)
   session.append('turn/start', { turn: 1 })
   const user = session.append('user/message', createUserMessage({
@@ -166,7 +167,6 @@ describe('web e2e: Markdown image rendering', () => {
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
-  let unpinBrowserClock: (() => void) | undefined
   const mediaResponses = new Map<string, number>()
 
   beforeAll(async () => {
@@ -180,7 +180,8 @@ describe('web e2e: Markdown image rendering', () => {
     await writeFile(join(scaffold.workspaceCwd, 'corrupt.png'), 'invalid image')
     const oversized = await open(join(scaffold.workspaceCwd, 'oversized.png'), 'w')
     try {
-      await oversized.truncate(20 * 1024 * 1024 + 1)
+      // One byte over attachment-local's default maxImageBytes (50 MiB), which also bounds /api/file.
+      await oversized.truncate(50 * 1024 * 1024 + 1)
     } finally {
       await oversized.close()
     }
@@ -191,7 +192,7 @@ describe('web e2e: Markdown image rendering', () => {
       { createdAt: WEB_FIXTURE_TIME - 60_000 })
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
-    unpinBrowserClock = await pinBrowserClock(page)
+    await pinBrowserClock(page)
     tripwire = watchConsole(page)
     page.on('response', (response) => {
       const url = new URL(response.url())
@@ -204,7 +205,6 @@ describe('web e2e: Markdown image rendering', () => {
   }, 120_000)
 
   afterAll(async () => {
-    unpinBrowserClock?.()
     await browser?.close()
     await scaffold?.close()
     if (imageOrigin !== undefined) await stopServer(imageOrigin.server)
@@ -277,7 +277,7 @@ describe('web e2e: Markdown image rendering', () => {
     await page.getByText(`Image preview unavailable · ${join(scaffold.workspaceCwd, 'corrupt.png')}`, { exact: true }).waitFor()
     expect(mediaResponses).toEqual(new Map([
       [join(scaffold.workspaceCwd, 'valid.png'), 200],
-      [`${scaffold.workspaceCwd}/./local-image.png`, 200],
+      [join(scaffold.workspaceCwd, 'local-image.png'), 200],
       [join(scaffold.workspaceCwd, 'test workspace/测试图.png'), 200],
       [join(scaffold.workspaceCwd, 'test workspace/测试#100%.png'), 200],
       [join(scaffold.workspaceCwd, 'oversized.png'), 413],
@@ -289,7 +289,18 @@ describe('web e2e: Markdown image rendering', () => {
     await page.getByRole('button', { name: `View full image: ${WORKSPACE_ALT}`, exact: true }).click()
     const lightbox = page.getByRole('dialog', { name: 'Image preview', exact: true })
     await lightbox.waitFor()
-    await lightbox.getByRole('button', { name: 'Close image preview' }).click()
+    const lightboxMask = lightbox.locator(':scope > div > [aria-hidden="true"]')
+    const lightboxClose = lightbox.getByRole('button', { name: 'Close image preview' })
+    for (const windows of [true, false]) {
+      await page.evaluate((value) => {
+        document.documentElement.toggleAttribute('data-windows-titlebar', value)
+        document.documentElement.style.setProperty('--dsh-windows-titlebar-height', value ? '40px' : '')
+      }, windows)
+      // The Windows caption stays unpainted and the close control sits below it.
+      expect((await lightboxMask.boundingBox())?.y).toBe(windows ? 40 : 0)
+      expect((await lightboxClose.boundingBox())?.y).toBe(windows ? 60 : 20)
+    }
+    await lightboxClose.click()
     await lightbox.waitFor({ state: 'detached' })
     const link = page.getByRole('button', { name: 'View comparison', exact: true })
     await link.hover()
@@ -310,6 +321,15 @@ describe('web e2e: Markdown image rendering', () => {
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
     await assertFixtureInventory(SNAPSHOT_DIR, ['ui.expected.md'])
+    const input = page.locator('[data-composer-input]').first()
+    await workspaceImage.dragTo(input)
+    const dragged = page.getByRole('group', { name: 'Pending attachments', exact: true }).getByRole('img')
+    await dragged.waitFor({ state: 'visible' })
+    expect(Buffer.from(await dragged.evaluate(async (node: HTMLImageElement) =>
+      Array.from(new Uint8Array(await (await fetch(node.src)).arrayBuffer()))))).toEqual(PNG)
+    expect(await input.innerText()).toBe('')
+    expect(await page.getByRole('dialog', { name: 'Image preview', exact: true }).count()).toBe(0)
+    await page.getByRole('button', { name: 'Remove image valid.png', exact: true }).click()
     await link.evaluate((element) => { element.scrollIntoView({ block: 'end' }) })
     await page.mouse.move(0, 0)
     await link.hover()

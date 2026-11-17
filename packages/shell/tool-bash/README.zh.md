@@ -25,6 +25,8 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
+新命令从 Session 的当前工作目录启动。相对 `workdir` 从该目录解析；单次调用的覆盖值与后台任务不会改变该目录。
+
 在 agent 需要运行 bash 命令的任何组合中加载本插件：一旦挂载执行器提供方与 `dsh-shell-env` 注册表，它就注册 `bash` 工具，并在 `tools`、`shell`、`systemPrompt` 与 `shellEnv` 服务就绪之前保持等待。
 
 ### 最小配置
@@ -61,7 +63,7 @@ kind: "package-reference"
 
 ### 前台命令即任务
 
-组合中有 job 注册表时，前台命令一启动就登记到 `ctx.jobs`，调用等待该任务：命令在运行期间始终被列出、经 `job.list` 与 `job.follow` 流式观看，并可从 Web 任务列表停止。在超时内完成的命令返回普通前台结果，其任务记录随结果一起离开注册表，模型从不看到 id。超过超时仍在运行的命令继续作为它本来就是的那个任务运行，调用返回 `[still running after <timeoutMs>ms; moved to background job <id>]` 加任务交接指引，并以一次消费式读取带上目前为止的输出——`job_output` 恰好从此处接续。来自调用之外的杀停（人在界面上停止任务）会让前台结果在信号标记之前带上 `[stopped: <reason>]`，模型读到的是原因而不是命令失败；取消调用本身则杀掉任务。登记是尽力而为的：`promoteOnTimeout: false`、缺少 job 注册表，或注册表在启动时拒绝该任务（持有者的任务上限、没有控制器）都会改为在执行器的 deadline 杀下运行命令，`timeoutMs` 参数描述也只在交接语义成立时才宣传它。
+组合中有 job 注册表时，前台命令一启动就登记到 `ctx.jobs`，调用等待该任务：命令在运行期间始终被列出、经 `job.list` 与 `job.follow` 流式观看，并可从 Web 任务列表停止。在超时内完成的命令返回普通前台结果，其任务记录随结果一起离开注册表，模型从不看到 id。超过超时仍在运行的命令继续作为它本来就是的那个任务运行，调用返回 `[still running after <timeoutMs>ms; moved to background job <id>]`，并以一次消费式读取带上目前为止的输出——`job_output` 恰好从此处接续。来自调用之外的杀停（人在界面上停止任务）会让前台结果在信号标记之前带上 `[stopped: <reason>]`，模型读到的是原因而不是命令失败；取消调用本身则杀掉任务。登记是尽力而为的：`promoteOnTimeout: false`、缺少 job 注册表，或注册表在启动时拒绝该任务（持有者的任务上限、没有控制器）都会改为在执行器的 deadline 杀下运行命令，`timeoutMs` 参数描述也只在交接语义成立时才宣传它。
 
 ### 沙箱执行与升权
 
@@ -69,7 +71,7 @@ kind: "package-reference"
 
 ### 可能出什么问题
 
-没有执行器提供方的组合永远不会激活该工具。没有任务运行时的后台调用会以 `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs` 失败；没有沙箱执行器时的 `sandbox_permissions` 会以 `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)` 失败。`enableRunInBackground: false` 会移除该参数，并在执行时拒绝强制后台调用。
+没有执行器提供方的组合永远不会激活该工具。没有任务运行时的后台调用会以 `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs` 失败；没有沙箱执行器时传入 `sandbox_permissions` 或 `justification` 会以 `invalid arguments: sandbox_permissions and justification are not available in this composition (no sandboxing executor to escalate)` 失败。`enableRunInBackground: false` 会移除该参数，并在执行时拒绝强制后台调用。
 
 -----
 
@@ -78,6 +80,8 @@ kind: "package-reference"
 
 <details>
 <summary>实现细节——点击展开</summary>
+
+前台与后台的结构化结果均包含 `cwd`，即执行器解析后的启动目录。持久化展示元数据携带同一值，使已结束的调用卡片保留该次调用使用的目录。命令内部的 `cd` 不会改变这个启动值；原生结果文本仍由 stdout、stderr 与状态标记组成。
 
 本节解释工具背后的设计决策，并指出实现它们的代码位置；可观察行为已在[使用本包](#use-this-package)中完整说明。
 
@@ -98,7 +102,7 @@ kind: "package-reference"
 
 ### 请求解析
 
-工具在 `ctx.shell.resolve()` 运行前解析 workdir：显式的相对 `workdir` 相对会话 cwd 解析，沙箱策略的规范化 workspace root 优先，使约束与启动使用同一身份。沙箱策略通过 `ctx.sandboxPolicy` 按调用解析；升权请求在任何执行前经由 `ctx.approval`，若执行器会约束命令却没有挂载策略服务，工具在加载时失败。
+工具在 `ctx.shell.resolve()` 运行前解析 workdir：显式的相对 `workdir` 相对 Session 当前目录解析，与沙箱权限根目录独立。沙箱策略通过 `ctx.sandboxPolicy` 按调用解析；升权请求在任何执行前经由 `ctx.approval`，若执行器会约束命令却没有挂载策略服务，工具在加载时失败。
 
 ### 渲染故事
 
@@ -192,7 +196,7 @@ renderer 输出依数据而定的 stdout 尾部，再输出可选的 `[stderr]` 
 
 #### 模型看到什么
 
-验证与策略失败统一为 `Error: <message>`。本包的稳定消息包括 `invalid command: expected a non-empty string`、`invalid description: expected a non-empty string`、`invalid timeoutMs: expected a positive number, got <value>`、升权配对失败、`run_in_background is disabled for this deployment (enableRunInBackground: false)`、`background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`、`sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`、审批不可用／拒绝／取消变体，以及 `tool call aborted`。
+验证与策略失败统一为 `Error: <message>`。本包的稳定消息包括 `invalid arguments: invalid command: expected a non-empty string`、`invalid arguments: invalid description: expected a non-empty string`、`invalid arguments: invalid timeoutMs: expected a positive number, got <value>`、升权配对失败、`invalid arguments: run_in_background is disabled for this deployment (enableRunInBackground: false)`、`background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`、`invalid arguments: sandbox_permissions and justification are not available in this composition (no sandboxing executor to escalate)`、审批不可用／拒绝／取消变体，以及 `tool call aborted`。每个失败还会在 `tool/result` 上记录 `error.name` 与 `error.code`：参数违规（包括 schema 未公开时传入的 `sandbox_permissions`、`justification` 或 `run_in_background`）为 `ToolArgsError`（`INVALID_ARGS`，消息前缀为 `invalid arguments: `），升权失败为 `SandboxEscalationError`（`SANDBOX_ESCALATION_INVALID_ARGUMENT`、`_UNAVAILABLE`、`_REJECTED`、`_CANCELLED`），缺少任务运行时为 `ToolContextUnavailableError`（`TOOL_CONTEXT_UNAVAILABLE`），取消为 `AbortError`（`ABORTED`）。启动或准备阶段的失败保留其抛出时的类与 code（例如 `SandboxUnavailableError` 或 `SandboxPreparationError`），无论调用是否在 job 上等待；按 errno `code` 识别的平台 spawn 错误转为 `SubprocessError`（`ENOENT` 为 `SUBPROCESS_SPAWN_NOT_FOUND`，其余为 `SUBPROCESS_SPAWN_FAILED`），在调用取消后才出现时也是如此。
 
 #### Token 影响
 

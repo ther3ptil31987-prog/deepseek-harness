@@ -1,10 +1,11 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -12,17 +13,19 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
-import { createAssistantMessage, createUserMessage, ToolCallId as ToolCallIdOf } from '@deepseek-ai/dsh-llm'
+import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { createAssistantMessage, createUserMessage, type ToolCallId as ToolCallIdOf } from '@deepseek-ai/dsh-llm'
 import type { LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment/types'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
-import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import ClaudeCodeMods, { defineMod, MODS_API_VERSION, type Config, type ModPlugin, type ModRegister } from '../src/index.ts'
 import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
@@ -78,7 +81,7 @@ interface HarnessOptions {
   /** Config per mod plugin, by name: the `options` its `register` receives. */
   readonly modConfig?: Record<string, Record<string, string | number | boolean | string[]>>
   readonly services?: (ctx: Context, workspace: string) => Promise<void>
-  readonly tools?: { mode?: 'native' | 'ptc' | 'both' }
+  readonly tools?: { mode?: 'native' | 'ptc' }
 }
 
 interface Harness {
@@ -108,6 +111,8 @@ async function harness(
   await ctx.plugin(CommandRuntime)
   const workspace = scratch('dsh-cc-mods-ws-')
   await options.services?.(ctx, workspace)
+  if (ctx.get('fs') === undefined) await ctx.plugin(LocalFileSystem, { cwd: workspace })
+  await ctx.plugin(WorkingDirectory, { defaultDirectory: workspace })
   const mods = await ctx.plugin(ClaudeCodeMods, { ...options.config })
   await mods.await()
   for (const entry of modsToLoad) {
@@ -118,7 +123,7 @@ async function harness(
   ctx.llm.registerAdapter(['mock'], adapter)
   return {
     ctx, adapter, workspace, mods, info, warn,
-    agent: id => ctx.agentLoop.create(SessionId(id ?? 'a1'), { provider: 'mock', model: 'mock' }, { cwd: workspace }),
+    agent: id => ctx.agentLoop.create(brandString<SessionId>(id ?? 'a1'), { provider: 'mock', model: 'mock' }, { cwd: workspace }),
     async turn(agent, text) {
       agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
       await agent.whenIdle()
@@ -246,7 +251,7 @@ describe('ticket-mod: a mod-registered tool, prompt context, and a turn.complete
     const agent = await h.agent()
     await h.turn(agent, 'open a PR for this change')
     expect(JSON.stringify(adapter.requests[0]?.messages)).toContain('Current branch: feature/mods')
-    const prompts = events(agent).filter(e => e.type === 'user/message')
+    const prompts = events(agent).filter(e => e.type === 'user/message' && e.data.source.kind === 'user')
     expect(prompts.map(e => e.type === 'user/message' && e.data.source)).toEqual([{ kind: 'user' }])
     expect(prompts[0]?.type === 'user/message' && prompts[0].data.content).toEqual([
       { type: 'text', text: 'open a PR for this change' },
@@ -290,7 +295,7 @@ describe('prompt.submit: rewrite and drop', () => {
     const h = await harness([mod], adapter)
     const agent = await h.agent()
     // Injected context alone is not a prompt: no prompt.submit is raised for it.
-    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'injected only' }], source: { kind: 'user-question-reply', callId: ToolCallIdOf('q0'), outcome: 'answered' } }))
+    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'injected only' }], source: { kind: 'user-question-reply', callId: brandString<ToolCallIdOf>('q0'), outcome: 'answered' } }))
     await h.turn(agent, '  hello there  ')
     const entered = events(agent).find(e => e.type === 'user/message' && e.data.source.kind === 'user')
     expect(entered?.type === 'user/message' && entered.data.content).toEqual([{ type: 'text', text: 'HELLO THERE' }])
@@ -413,7 +418,7 @@ describe('tool.call: answers and rewrites', () => {
       'claude-code-mods: reroute-mod: tool.call hook skipped: rerouted the call from echo to Read; the logged call runs the tool it named',
     )
     // A call without an agent (a host-side execute) is answered by the same schema rule.
-    const direct = await h.ctx.tools.execute({ callId: ToolCallIdOf('direct'), name: 'greet', arguments: {}, signal: new AbortController().signal })
+    const direct = await executeToolFixture(h.ctx, { callId: brandString<ToolCallIdOf>('direct'), name: 'greet', arguments: {}, signal: new AbortController().signal })
     expect(direct.isError).toBe(false)
     expect(direct.content).toEqual([{ type: 'text', text: 'rendered hello from answer-mod' }])
     const refusals = h.warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('rewrote the arguments of echo'))
@@ -533,7 +538,11 @@ describe('the mods API over harness services', () => {
         id: 'a1', cwd: h.workspace, root: h.workspace, model: 'mock', turns: 1,
         version: MODS_API_VERSION,
         usage: { startedAt: agent.session.header.createdAt, context: { window: 0 }, rateLimits: [] },
-        messages: [{ role: 'user', text: 'hello', toolUses: [] }, { role: 'assistant', text: 'ok', toolUses: [] }],
+        messages: [
+          { role: 'user', text: 'hello', toolUses: [] },
+          { role: 'user', text: `<system-reminder>\nThe following information describes your current session:\n\nCurrent working directory: ${JSON.stringify(h.workspace)}.\n</system-reminder>`, toolUses: [] },
+          { role: 'assistant', text: 'ok', toolUses: [] },
+        ],
       })
       expect(out.store).toEqual({ count: 7, keys: ['count'] })
       expect(out.env).toBe('yes')
@@ -721,6 +730,8 @@ describe('mod tools: registration errors and unanswered calls', () => {
     expect(results[0]).toEqual([true, { type: 'text', text: "Error: tools-mod registered mcp__tools-mod__orphan but no tool.call hook answered it; add on('tool.call', { tool: 'mcp__tools-mod__orphan' }, hook)" }])
     expect(results[1]).toEqual([false, { type: 'text', text: '{"structured":true}' }])
     expect(results[2]).toEqual([false, { type: 'text', text: '' }])
+    const unanswered = events(agent).find(e => e.type === 'tool/result')
+    expect(unanswered?.type === 'tool/result' && unanswered.data.error).toEqual({ name: 'ModUnansweredError', code: 'MOD_UNANSWERED' })
   })
 })
 
@@ -751,8 +762,8 @@ describe('subagents, programmatic calls, and malformed tool arguments', () => {
     `)
     const malformedCall = [
       { type: 'block-start' as const, index: 0, blockType: 'tool-call' as const },
-      { type: 'tool-call-delta' as const, index: 0, id: ToolCallIdOf('m1'), name: 'echo', argumentsDelta: '{bad json' },
-      { type: 'block-end' as const, index: 0, block: { type: 'tool-call' as const, id: ToolCallIdOf('m1'), name: 'echo', arguments: '{bad json' } },
+      { type: 'tool-call-delta' as const, index: 0, id: brandString<ToolCallIdOf>('m1'), name: 'echo', argumentsDelta: '{bad json' },
+      { type: 'block-end' as const, index: 0, block: { type: 'tool-call' as const, id: brandString<ToolCallIdOf>('m1'), name: 'echo', arguments: '{bad json' } },
       { type: 'finish' as const, reason: { kind: 'tool-calls' as const } },
     ]
     const adapter = new MockAdapter([
@@ -763,7 +774,7 @@ describe('subagents, programmatic calls, and malformed tool arguments', () => {
     h.ctx.tools.register(echoTool('echo'))
     const root = await h.agent()
     const child = await h.ctx.agentLoop.createAgent(h.ctx, {
-      sessionId: SessionId('child-1'), parentAgent: root, agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: h.workspace, origin: 'subagent' },
+      sessionId: brandString<SessionId>('child-1'), agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: h.workspace, origin: 'subagent' },
     })
     await h.turn(child.agent, 'child task')
     await child.dispose()
@@ -779,7 +790,7 @@ describe('subagents, programmatic calls, and malformed tool arguments', () => {
       'watch-mod: tool.call echo agent=root n=1',
       'watch-mod: turn.complete agent=root inputs=[{}]',
     ])
-    const direct = await h.ctx.tools.execute({ callId: ToolCallIdOf('direct'), name: 'echo', arguments: { command: 'direct' }, signal: new AbortController().signal })
+    const direct = await executeToolFixture(h.ctx, { callId: brandString<ToolCallIdOf>('direct'), name: 'echo', arguments: { command: 'direct' }, signal: new AbortController().signal })
     expect(direct.isError).toBe(false)
     // The nested `$.tool.call` reaches only mods loaded before watch-mod, so its own hook is not re-entered.
     expect(h.info).toHaveBeenCalledWith('watch-mod: direct saw echo and {"result":"ran nested"}')
@@ -816,7 +827,7 @@ describe('turn.complete reasons and sessions the bridge did not follow from the 
     agent.session.append('turn/end', { turn: 9, reason: { kind: 'completed' } })
     await waitFor(() => lines().length === 4)
     expect(lines()[3]).toBe('ends-mod: turn.complete 9 answer aborted=false answer="" usage=none')
-    const orphan = h.ctx.sessions.create(SessionId('orphan'))
+    const orphan = h.ctx.sessions.create(brandString<SessionId>('orphan'))
     orphan.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(lines()).toHaveLength(4)
@@ -829,7 +840,7 @@ describe('turn.complete reasons and sessions the bridge did not follow from the 
       }
     `)
     const h = await harness([mod], new MockAdapter([]))
-    const handle = await h.ctx.agentLoop.createAgent(h.ctx, { sessionId: SessionId('ends'), agentOptions: { provider: 'mock', model: 'mock' } })
+    const handle = await h.ctx.agentLoop.createAgent(h.ctx, { sessionId: brandString<SessionId>('ends'), agentOptions: { provider: 'mock', model: 'mock' } })
     // An assistant message outside any turn the bridge follows is left alone.
     handle.agent.session.append('assistant/message', {
       turn: 0, step: 0, stream: [],
@@ -914,17 +925,19 @@ describe('loading diagnostics and configuration', () => {
     const mod = writeMod('sleeper-mod', `
       export function register(on) {
         on('session.start', async ($, e, next) => {
-          $.clock.after(1, async () => { await $.clock.sleep(60_000) })
+          $.clock.after(1, async () => {
+            const sleeping = $.clock.sleep(60_000)
+            await $.ui.log('timer sleeping')
+            await sleeping
+          })
           return next(e)
         })
       }
     `)
     const h = await harness([mod], new MockAdapter([]))
     await h.agent()
-    await new Promise(resolve => setTimeout(resolve, 20))
-    const started = Date.now()
+    await vi.waitFor(() => { expect(h.info.mock.calls.flat().join(' ')).toContain('timer sleeping') })
     await h.mods.dispose()
-    expect(Date.now() - started).toBeLessThan(5_000)
     expect(h.warn).toHaveBeenCalledWith('claude-code-mods: sleeper-mod: timer callback failed: claude-code-mods disposed')
   })
 
@@ -944,7 +957,7 @@ describe('loading diagnostics and configuration', () => {
   })
 
   it('is a Service plugin the Loader keeps by its default export', () => {
-    expect(ClaudeCodeMods.inject).toEqual([])
+    expect(ClaudeCodeMods.inject).toEqual(['workingDirectory', 'agents'])
     const loader = Object.create(Loader.prototype) as Loader
     const unwrapped: unknown = loader.unwrapExports({ default: ClaudeCodeMods })
     expect(unwrapped).toBe(ClaudeCodeMods)
@@ -978,7 +991,7 @@ describe('post-execute interplay and prompt rewrites with images', () => {
     const agent = await h.agent()
     const image = { type: 'image' as const, attachment: { attachmentId: 'att-1', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } as ImageAttachmentRef }
     // Injected context from another plugin is claimed with the waking prompt; only the human's message is the prompt.
-    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'injected by a plugin' }], source: { kind: 'user-question-reply', callId: ToolCallIdOf('q1'), outcome: 'answered' } }))
+    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'injected by a plugin' }], source: { kind: 'user-question-reply', callId: brandString<ToolCallIdOf>('q1'), outcome: 'answered' } }))
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'first' }, image, { type: 'text', text: 'second' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     const entered = () => events(agent).filter(e => e.type === 'user/message').map(e => e.type === 'user/message' && e.data.content)
@@ -996,7 +1009,7 @@ describe('post-execute interplay and prompt rewrites with images', () => {
     agent.followup(createUserMessage({ content: [image], source: { kind: 'user' } }))
     await agent.whenIdle()
     expect(entered().at(-1)).toEqual([image, { type: 'text', text: 'rewritten: ' }])
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'from a plugin' }], source: { kind: 'user-question-reply', callId: ToolCallIdOf('q2'), outcome: 'answered' } }))
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'from a plugin' }], source: { kind: 'user-question-reply', callId: brandString<ToolCallIdOf>('q2'), outcome: 'answered' } }))
     await agent.whenIdle()
     expect(entered().at(-1)).toEqual([{ type: 'text', text: 'from a plugin' }])
   })
@@ -1070,6 +1083,13 @@ describe('the band above the prompt', () => {
         await ctx.plugin(LocalSubprocessRuntime)
       },
     })
+    // Windows does not provide the POSIX sleep executable; other subprocesses run normally.
+    const spawn = h.ctx.subprocess.spawn.bind(h.ctx.subprocess)
+    const withoutSleep = vi.spyOn(h.ctx.subprocess, 'spawn').mockImplementation((spec) => {
+      if (spec.argv[0] === 'sleep') throw new Error('spawn sleep ENOENT')
+      return spawn(spec)
+    })
+    onTestFinished(() => { withoutSleep.mockRestore() })
     h.ctx.tools.register(echoTool('bash', ran))
     const agent = await h.agent()
     const mods = h.ctx.claudeCodeMods
@@ -1097,6 +1117,7 @@ describe('the band above the prompt', () => {
     expect(cancelId).toBeDefined()
     await mods.pressBand(agent, drawn.generation, cancelId ?? '')
     await holding
+    expect(h.warn).not.toHaveBeenCalledWith(expect.stringMatching(/tool.call hook skipped/))
     expect(ran).toEqual([])
     expect(toolResult(agent)?.text).toMatch(/Blast Radius held this command: the user pressed Cancel/)
     await waitFor(() => !JSON.stringify(seen.at(-1)).includes('Cancel'))

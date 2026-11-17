@@ -1,4 +1,7 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { spawnSync } from 'node:child_process'
+import { unsupportedModel, provideWorkingDirectoryFixture, unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { release, tmpdir, version } from 'node:os'
 import { join } from 'node:path'
@@ -7,8 +10,9 @@ import { afterEach, describe, expect, it, onTestFailed, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
-import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { SESSION_FORMAT_VERSION, Session, type SessionId } from '@deepseek-ai/dsh-session'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -23,7 +27,6 @@ import { resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local/src/resolve.ts'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRegistry from '@deepseek-ai/dsh-tools'
 import * as ToolPwshPersistent from '@deepseek-ai/dsh-tool-pwsh-persistent'
-import { unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { ReadinessTimeline, TIMELINE_HEADER } from './readiness-timeline.ts'
 
 const pwshPath = resolvePwshPath()
@@ -32,12 +35,11 @@ const hasPwsh = spawnSync(
   { encoding: 'utf8' },
 ).status === 0
 
-// Shell and console-host versions for a failure message: the Windows console host, not this
-// process, decides how the prompt marker and its tail reach the session, and its build on the
-// self-hosted pool is unknown.
+// The system conhost version identifies the host OS; Windows PTYs use node-pty's bundled
+// OpenConsole, so that version does not identify the console rendering these sessions.
 const HOST_FACTS_COMMAND = [
   '"pwsh $($PSVersionTable.PSVersion) PSReadLine $((Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1).Version)"',
-  'if ($env:OS -eq \'Windows_NT\') { "conhost $((Get-Item (Join-Path $env:SystemRoot \'System32\\conhost.exe\')).VersionInfo.FileVersion)" }',
+  'if ($env:OS -eq \'Windows_NT\') { "system conhost (unused) $((Get-Item (Join-Path $env:SystemRoot \'System32\\conhost.exe\')).VersionInfo.FileVersion)" }',
 ].join('; ')
 
 function hostFacts(): string {
@@ -51,9 +53,9 @@ function hostFacts(): string {
   return [
     `host: ${process.platform} ${process.arch} ${release()} (${version()}); node ${process.version}`,
     `shell: ${pwshPath}; ${shell}`,
-    // dsh-subprocess-local spawns node-pty without useConptyDll, so the system console host,
-    // not the OpenConsole build node-pty bundles, renders every session.
-    'conpty: system conhost',
+    process.platform === 'win32'
+      ? 'conpty: node-pty bundled OpenConsole (useConptyDll=true)'
+      : 'conpty: not applicable (POSIX PTY)',
   ].join('\n')
 }
 
@@ -75,7 +77,7 @@ class PassthroughSandbox extends SandboxProvider {
 }
 
 async function agent(ctx: Context, cwd: string): Promise<Agent> {
-  const id = SessionId('persistent-pwsh-loader-agent')
+  const id = brandString<SessionId>('persistent-pwsh-loader-agent')
   const scope = ctx.plugin(() => {})
   const session = Session.create(id, [], {
     version: SESSION_FORMAT_VERSION, id, createdAt: 0, cwd, isSeeded: false,
@@ -84,6 +86,7 @@ async function agent(ctx: Context, cwd: string): Promise<Agent> {
     id,
     options: {},
     session,
+    model: unsupportedModel(),
     inbox: unsupportedInbox(),
     status: 'idle',
     ctx: scope.ctx,
@@ -111,6 +114,7 @@ describe.skipIf(!hasPwsh)('persistent pwsh through a real cordis.yml Loader comp
       "- name: '@deepseek-ai/dsh-agent'",
       "- name: '@deepseek-ai/dsh-system-prompt'",
       "- name: '@deepseek-ai/dsh-tools'",
+      "- name: '@deepseek-ai/dsh-tool-executor-native'",
       "- name: '@deepseek-ai/dsh-terminal'",
       "- name: '@deepseek-ai/dsh-test-sandbox'",
       "- name: '@deepseek-ai/dsh-session-projection'",
@@ -149,6 +153,8 @@ describe.skipIf(!hasPwsh)('persistent pwsh through a real cordis.yml Loader comp
     ].join('\n'))
 
     context = new Context()
+
+    provideWorkingDirectoryFixture(context)
     context.baseUrl = pathToFileURL(root).href + '/'
     await context.plugin(Loader)
     context.loader.builtins.include = Include
@@ -156,6 +162,7 @@ describe.skipIf(!hasPwsh)('persistent pwsh through a real cordis.yml Loader comp
       ['@deepseek-ai/dsh-agent', AgentRegistry],
       ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
       ['@deepseek-ai/dsh-tools', ToolRegistry],
+      ['@deepseek-ai/dsh-tool-executor-native', NativeToolExecutor],
       ['@deepseek-ai/dsh-terminal', TerminalSessionService],
       ['@deepseek-ai/dsh-test-sandbox', PassthroughSandbox],
       ['@deepseek-ai/dsh-session-projection', SessionProjectionRegistry],
@@ -213,9 +220,9 @@ describe.skipIf(!hasPwsh)('persistent pwsh through a real cordis.yml Loader comp
     const signal = new AbortController().signal
     const execute = (id: string, command: string) => {
       timeline.label(id)
-      return context!.tools.execute({
+      return executeToolFixture(context!, {
         signal,
-        callId: ToolCallId(id),
+        callId: brandString<ToolCallId>(id),
         name: 'pwsh',
         arguments: { command },
         agent: owner,
@@ -246,22 +253,23 @@ describe.skipIf(!hasPwsh)('persistent pwsh through a real cordis.yml Loader comp
     expect(large).toContain('<response clipped>')
     expect(large).not.toContain('beginning of this command output was dropped')
 
+    const afterScroll = text(await execute('after-scroll', 'Write-Output "cwd=$PWD keep=$env:KEEP"'))
+    expect(afterScroll).toBe(`cwd=${join(root, 'nested')} keep=loader`)
+
     const exited = text(await execute('exit', 'exit'))
     expect(exited).toContain('next pwsh call starts from the workspace')
     expect(text(await execute('after-exit', 'Write-Output "$PWD"'))).toBe(root)
 
-    // Six commands settle on the controlled prompt; no send may fall back to the
-    // silence tier, which is the 3.3 s-per-call degradation this suite pins. The
-    // counts alone do not say which tier settled which send, so every reason the
-    // run recorded and the per-send timeline ride in the failure message (the
-    // self-hosted Windows lane reported one to two stdin_read settlements per
-    // run on 2026-09-25..27, every other send at the plain silence bound). The
-    // message is built only when an assertion is about to fail: formatting runs
-    // the host-facts shell probe, which a passing run must not pay for.
-    const stdinReads = settleReasons.filter(reason => reason === 'stdin_read').length
-    const degraded = stdinReads < 6 || settleReasons.includes('inferred_idle')
+    // Each ordinary command must settle on the prompt, including the next command on the
+    // scrolled shell and the first command after restart. Extra sends can conceal a timeout.
+    // Formatting probes host versions, so only a failed sequence pays that cost.
+    const expected: TerminalWaitReason[] = [
+      'stdin_read', 'stdin_read', 'stdin_read', 'stdin_read',
+      'stdin_read', 'stdin_read', 'session_exit', 'stdin_read',
+    ]
+    const degraded = settleReasons.length !== expected.length
+      || settleReasons.some((reason, index) => reason !== expected[index])
     const failure = degraded ? `${JSON.stringify(settleReasons)}\n${timeline.format()}` : ''
-    expect(stdinReads, failure).toBeGreaterThanOrEqual(6)
-    expect(settleReasons, failure).not.toContain('inferred_idle')
+    expect(settleReasons, failure).toEqual(expected)
   }, 120_000)
 })

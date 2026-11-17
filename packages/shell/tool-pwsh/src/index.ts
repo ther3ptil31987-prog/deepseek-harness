@@ -21,22 +21,24 @@
  */
 
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+import type {} from '@deepseek-ai/dsh-working-directory'
 import { FiberState } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { defineTool, TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
+import { defineTool, TOOL_ABORTED, ToolArgsError, ToolContextUnavailableError } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, TerminalCallView, ToolDefinition, ToolExecution, ToolResult, ToolResultView } from '@deepseek-ai/dsh-tools'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JobId, JobRegistry, JobView } from '@deepseek-ai/dsh-jobs'
 import type {} from '@deepseek-ai/dsh-shell-env'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { ESCALATION_TARGETS, approveEscalation, sandboxPermissionsDescription, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
+import { subprocessSpawnFailure } from '@deepseek-ai/dsh-subprocess'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ShellExecRequest, ShellExecSpec, ShellExecution, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { parseExitStatus } from '@deepseek-ai/dsh-shell'
 import { processJob, processOutcome, processSources, ringDelta } from './background.ts'
+import type { ProcessJobHooks } from './background.ts'
 import { renderPwshJobRead, renderPwshPromoted, renderPwshResult } from './render.ts'
 import type { RenderablePwshResult } from './render.ts'
 
@@ -47,7 +49,7 @@ declare module '@deepseek-ai/dsh-jobs' {
 }
 
 export const name = 'tool-pwsh'
-export const inject = ['tools', 'shell', 'systemPrompt', 'shellEnv']
+export const inject = ['tools', 'shell', 'systemPrompt', 'shellEnv', 'workingDirectory']
 
 /* jscpd:ignore-start -- the pwsh Config mirrors tool-bash's by design, like render/background. */
 /** Configuration for the pwsh tool. */
@@ -89,6 +91,7 @@ interface PwshToolArgs {
 
 /** The canonical foreground result of one pwsh call (the `output.schema` value shape). */
 interface PwshForegroundResult {
+  cwd: string
   kind: 'foreground'
   exitCode: number | null
   signal: NodeJS.Signals | null
@@ -103,18 +106,45 @@ interface PwshForegroundResult {
 }
 
 /* jscpd:ignore-start -- minimal mirror of dsh-tool-bash's validation and execute plumbing (Agent Note). */
-function validatePwshArgs(args: PwshToolArgs): void {
+/** Which optional argument groups the registered schema advertises in this composition. */
+interface AdvertisedArgs {
+  /** `sandbox_permissions` and `justification`; advertised only with a sandboxing executor. */
+  escalation: boolean
+  /** `run_in_background`; advertised unless `enableRunInBackground: false`. */
+  background: boolean
+}
+
+/**
+ * Reject arguments the schema does not advertise. Schema validation checks
+ * advertised keys only, so these still reach `execute`; the model fixes the call
+ * by dropping them, which makes them argument errors. Runs before escalation
+ * pairing checks, approval, and working-directory setup.
+ * @param args - the call's arguments.
+ * @param advertised - the argument groups this composition advertises.
+ */
+function rejectUnadvertisedArgs(
+  args: { sandbox_permissions?: string; justification?: string; run_in_background?: boolean },
+  advertised: AdvertisedArgs,
+): void {
+  if (!advertised.escalation && (args.sandbox_permissions !== undefined || (args.justification ?? '').trim() !== '')) {
+    throw new ToolArgsError(['sandbox_permissions and justification are not available in this composition (no sandboxing executor to escalate)'])
+  }
+  if (!advertised.background && args.run_in_background === true) {
+    throw new ToolArgsError(['run_in_background is disabled for this deployment (enableRunInBackground: false)'])
+  }
+}
+
+function validatePwshArgs(args: PwshToolArgs, advertised: AdvertisedArgs): void {
   if (args.command.trim().length === 0) {
-    throw new Error('invalid command: expected a non-empty string')
+    throw new ToolArgsError(['invalid command: expected a non-empty string'])
   }
   if (args.description.trim().length === 0) {
-    throw new Error('invalid description: expected a non-empty string')
+    throw new ToolArgsError(['invalid description: expected a non-empty string'])
   }
   if (args.timeoutMs !== undefined && (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0)) {
-    throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
+    throw new ToolArgsError([`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`])
   }
-  // The escalation pairing (sandbox_permissions ⇔ justification, non-empty) is
-  // the shared rule both enforcing families validate identically.
+  rejectUnadvertisedArgs(args, advertised)
   validateEscalationArgs(args.sandbox_permissions, args.justification)
 }
 /* jscpd:ignore-end */
@@ -149,27 +179,24 @@ function pwshDescription(windowsSandbox: boolean): string {
     + 'avoid capturing output.'
 }
 
-/**
- * Resolve an explicit workdir first, making a relative one session-workspace-relative;
- * otherwise use the session header cwd and leave executor defaulting as the fallback.
- */
-function resolveWorkdir(modelWorkdir: string | undefined, exec: { agent?: Agent }): string | undefined {
-  const headerCwd = exec.agent?.session.header.cwd
-  if (modelWorkdir === undefined) return headerCwd
-  if (headerCwd !== undefined && !isAbsolute(modelWorkdir)) {
-    return resolvePath(headerCwd, modelWorkdir)
+/** Resolve a relative per-call override against the Session's current directory. */
+function resolveWorkdir(modelWorkdir: string | undefined, sessionCwd: string | undefined): string | undefined {
+  if (modelWorkdir === undefined) return sessionCwd
+  if (sessionCwd !== undefined && !isAbsolute(modelWorkdir)) {
+    return resolvePath(sessionCwd, modelWorkdir)
   }
   return modelWorkdir
 }
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
-function canonicalPwshResult(result: ShellRunResult): PwshForegroundResult {
+function canonicalPwshResult(result: ShellRunResult, cwd: string): PwshForegroundResult {
   const output = (stream: ShellRunResult['stdout']) => ({
     text: stream.text,
     truncated: stream.truncated,
     ...stream.spillPath !== undefined ? { spillPath: stream.spillPath } : {},
   })
   return {
+    cwd,
     kind: 'foreground',
     exitCode: result.exitCode,
     signal: result.signal,
@@ -197,17 +224,31 @@ function toolAborted(): HarnessError {
   return error
 }
 
+/**
+ * Report a launch or preparation rejection as this tool's failure. This
+ * call's cancellation reason stays as thrown so the registry records it as
+ * aborted; a platform spawn error is classified as a subprocess spawn failure
+ * with the original as `cause`; any other value, including a coded error,
+ * keeps its own identity.
+ */
+function launchFailure(error: unknown, signal: AbortSignal): unknown {
+  return signal.aborted && error === signal.reason ? error : subprocessSpawnFailure(error, 'pwsh')
+}
+
 /** A registered command: its id, the process once the starter spawned it, and the reason an outside kill gave. */
 interface StartedJob {
   readonly id: JobId
   readonly process: () => ShellExecution | undefined
   readonly stopped: () => string | undefined
+  /** The original error of a registration whose preparation failed before the process published. */
+  readonly failure: () => { error: unknown } | undefined
 }
 
 /** Canonical background-handle properties shared by the pwsh output union. */
 const BACKGROUND_OUTPUT_PROPERTIES = {
   kind: { type: 'string', required: true, const: 'background' },
   jobId: { type: 'string', required: true },
+  cwd: { type: 'string', required: true },
 } as const
 /* jscpd:ignore-end */
 
@@ -233,13 +274,11 @@ export function apply(ctx: Context, config: Config = {}): void {
    * Resolve a sandbox-escalation request through `ctx.approval` BEFORE
    * anything executes, delegating the shared fail-closed sequence (strict
    * widening, channel resolution, outcome mapping) to
-   * {@link approveEscalation}. This tool contributes only the composition
-   * guard (the fields are unadvertised without a sandboxing executor, yet
-   * schema validation checks advertised keys only, so an unadvertised
-   * `sandbox_permissions` still reaches execute) and the approval
-   * ingredients. The shared policy resolver is required whenever the
-   * executor advertises confinement, so a split composition fails at
-   * tool-plugin load.
+   * {@link approveEscalation}. This tool contributes only the approval
+   * ingredients; {@link validatePwshArgs} has already rejected the fields when
+   * no sandboxing executor advertises them. The shared policy resolver is
+   * required whenever the executor advertises confinement, so a split
+   * composition fails at tool-plugin load.
    */
   const approvePwshEscalation = (
     mode: string,
@@ -247,9 +286,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     exec: ToolExecution,
     standingPolicy: SandboxExecutionPolicy | undefined,
   ): Promise<SandboxMode> => {
-    if (escalationModes.length === 0) {
-      throw new Error('sandbox_permissions is not available in this composition (no sandboxing executor to escalate)')
-    }
     const effectiveMode = (standingPolicy as SandboxExecutionPolicy).mode
     return approveEscalation(
       { requestedMode: mode, justification, effectiveMode, subject: 'command' },
@@ -284,31 +320,34 @@ export function apply(ctx: Context, config: Config = {}): void {
     const startJob = (registry: JobRegistry, args: PwshToolArgs, exec: ToolExecution, spec: ShellExecSpec): StartedJob => {
       let proc: ShellExecution | undefined
       let stopped: string | undefined
+      let hooks: ProcessJobHooks | undefined
       const id = registry.start({
         kind: 'pwsh',
         label: args.command,
+        toolCall: { callId: exec.callId, rootCallId: exec.rootCallId },
         ...exec.agent ? { owner: exec.agent.id } : {},
         output: processSources(() => proc),
         run: () => {
-          const hooks = processJob(
+          const job = processJob(
             async (signal) => {
               proc = await ctx.shell.execute({ ...spec, signal })
               return proc
             },
             started => processOutcome(started, escalationModes),
           )
+          hooks = job
           return {
-            done: hooks.done,
+            done: job.done,
             // A kill from outside this call (the human's, a parallel job_kill)
             // reaches the process here; its reason is what the model reads.
             cancel: (reason) => {
               stopped = reason
-              hooks.cancel(reason)
+              job.cancel(reason)
             },
           }
         },
       })
-      return { id, process: () => proc, stopped: () => stopped }
+      return { id, process: () => proc, stopped: () => stopped, failure: () => hooks?.failure() }
     }
     /** Wait on a registered foreground command until it settles or the timeout passes. */
     const waitOnJob = async (registry: JobRegistry, attached: StartedJob, exec: ToolExecution, spec: ShellExecSpec) => {
@@ -343,6 +382,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         await stop('timed out during preparation')
         return {
           kind: 'foreground' as const,
+          cwd: spec.workdir,
           exitCode: null,
           signal: null,
           timedOut: true,
@@ -360,6 +400,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         const read = registry.read(attached.id, owner)
         return {
           kind: 'promoted' as const,
+          cwd: spec.workdir,
           jobId: attached.id,
           timeoutMs,
           output: renderPwshJobRead(
@@ -372,13 +413,16 @@ export function apply(ctx: Context, config: Config = {}): void {
       // the split streams and classification the foreground result needs.
       registry.remove(attached.id, owner)
       const process = attached.process()
-      // No process was published: the starter failed before the spawn, and the
-      // job's terminal detail is the failure the foreground projection would
-      // have rejected with.
-      if (process === undefined) throw new Error(view.detail)
-      const result = await process.result()
+      // No process was published: the starter failed before the spawn. The
+      // original error keeps its class and code, exactly as the foreground
+      // projection would have rejected; a kill before the spawn has only its detail.
+      if (process === undefined) {
+        const failure = attached.failure()
+        throw failure === undefined ? new Error(view.detail) : launchFailure(failure.error, exec.signal)
+      }
+      const result = await process.result().catch((error: unknown) => { throw launchFailure(error, exec.signal) })
       const stopped = attached.stopped()
-      return { ...canonicalPwshResult(result), ...stopped !== undefined ? { stopped } : {} }
+      return { ...canonicalPwshResult(result, spec.workdir), ...stopped !== undefined ? { stopped } : {} }
     }
     /* jscpd:ignore-end */
     return defineTool({
@@ -435,6 +479,7 @@ export function apply(ctx: Context, config: Config = {}): void {
               additionalProperties: false,
               properties: {
                 kind: { type: 'string', required: true, const: 'promoted' },
+                cwd: { type: 'string', required: true },
                 jobId: { type: 'string', required: true },
                 timeoutMs: { type: 'number', required: true },
                 output: { type: 'string', required: true },
@@ -445,6 +490,7 @@ export function apply(ctx: Context, config: Config = {}): void {
               additionalProperties: false,
               properties: {
                 kind: { type: 'string', required: true, const: 'foreground' },
+                cwd: { type: 'string', required: true },
                 exitCode: { required: true, oneOf: [{ type: 'integer' }, { type: 'null' }] },
                 signal: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
                 timedOut: { type: 'boolean', required: true },
@@ -494,10 +540,11 @@ export function apply(ctx: Context, config: Config = {}): void {
               ? renderPwshPromoted(value)
               : renderPwshResult(value as RenderablePwshResult, escalationModes),
         }],
+        presentationMeta: (_args, value) => ({ cwd: value.cwd }),
       },
       /* jscpd:ignore-start -- the execute path mirrors dsh-tool-bash's by design (see the pwsh-tool-and-executor Agent Note). */
       async execute(args: PwshToolArgs, exec) {
-        validatePwshArgs(args)
+        validatePwshArgs(args, { escalation: escalationModes.length > 0, background: backgroundEnabled })
         // Description is display metadata; workdir defaults to the caller's session.
         const standingPolicy = resolveSandboxPolicy(exec)
         const approvedMode = args.sandbox_permissions !== undefined && args.justification !== undefined
@@ -506,7 +553,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         const policy = approvedMode === undefined
           ? standingPolicy
           : { ...(standingPolicy as SandboxExecutionPolicy), mode: approvedMode }
-        const workdir = resolveWorkdir(args.workdir, exec)
+        const cwd = exec.agent === undefined ? undefined : await ctx.workingDirectory.ensure(exec.agent, exec.signal)
+        const workdir = resolveWorkdir(args.workdir, cwd)
         const request: ShellExecRequest = {
           command: args.command,
           ...workdir !== undefined ? { workdir } : {},
@@ -515,16 +563,13 @@ export function apply(ctx: Context, config: Config = {}): void {
           ...policy !== undefined ? { sandboxPolicy: policy } : {},
         }
         if (args.run_in_background === true) {
-          // Undeclared keys are allowed, so schema omission also needs enforcement.
-          if (!backgroundEnabled) {
-            throw new Error('run_in_background is disabled for this deployment (enableRunInBackground: false)')
-          }
           if (jobs === undefined) {
-            throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
+            throw new ToolContextUnavailableError('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
           }
           // The caller owns cancellation until ctx.jobs commits detached ownership.
           if (exec.signal.aborted) throw toolAborted()
-          return { kind: 'background' as const, jobId: startJob(jobs, args, exec, ctx.shell.resolve({ ...request, onExpiry: 'none' })).id }
+          const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
+          return { kind: 'background' as const, jobId: startJob(jobs, args, exec, spec).id, cwd: spec.workdir }
         }
         // A foreground call is a job the tool waits on, so the command is
         // visible and killable from the moment it starts and outlives the wait
@@ -541,10 +586,15 @@ export function apply(ctx: Context, config: Config = {}): void {
           }
           if (attached !== undefined) return waitOnJob(jobs, attached, exec, spec)
         }
-        const foreground = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
-        const result = await foreground.result()
+        const spec = ctx.shell.resolve({ ...request, signal: exec.signal })
+        let result: ShellRunResult
+        try {
+          result = await (await ctx.shell.execute(spec)).result()
+        } catch (error) {
+          throw launchFailure(error, exec.signal)
+        }
         if (result.aborted) throw toolAborted()
-        return canonicalPwshResult(result)
+        return canonicalPwshResult(result, spec.workdir)
       },
       /* jscpd:ignore-end */
       /* jscpd:ignore-start -- the background call card mirrors presentBashCall's by design (Agent Note). */

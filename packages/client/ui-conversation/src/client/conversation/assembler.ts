@@ -1,9 +1,9 @@
 import type {
   SessionAssistantSettlementEntry, SessionEventLikeEntry, SessionTransientEventEntry,
 } from '@deepseek-ai/dsh-api-session-controller/client'
-import type { LlmAttemptId } from '@deepseek-ai/dsh-llm/brand'
+import type { LlmAttemptId } from '@deepseek-ai/dsh-llm/types'
 import type {
-  ConversationContextReader, ConversationLocationData, ConversationMatch,
+  ConversationContextReader, ConversationLocationData, ConversationMatch, ConversationMatchResult,
   ConversationNodeContext, ConversationNodeDefinition, ConversationPreviousContext,
   ConversationLocationDataScope, ConversationPublication, ConversationViewBuilder,
   ConversationStartMatch,
@@ -61,6 +61,30 @@ interface GroupState {
   readonly definition: ConversationGroupDefinition
   state: unknown
   readonly store: ConversationGroupStore<unknown>
+}
+
+/**
+ * Failure of an incremental Conversation update.
+ * When `rebuilt` is true, every active view already shows a complete rebuild of
+ * the loaded window, and `cause` is the original failure. When it is false, the
+ * rebuild or its view replacement also failed, and `cause` is an
+ * `AggregateError` of both failures; the next flush retries that rebuild or replacement.
+ */
+export class ConversationUpdateError extends Error {
+  /** Whether every active view shows the complete rebuild. */
+  readonly rebuilt: boolean
+
+  /**
+   * @param rebuilt - whether every active view shows the complete rebuild.
+   * @param options - the original failure, or an `AggregateError` of both failures, as `cause`.
+   */
+  constructor(rebuilt: boolean, options: ErrorOptions) {
+    super(rebuilt
+      ? 'conversation update failed; the loaded window was rebuilt'
+      : 'conversation update failed, and rebuilding the loaded window also failed', options)
+    this.name = 'ConversationUpdateError'
+    this.rebuilt = rebuilt
+  }
 }
 
 const PUBLICATION_RANK: Record<ConversationPublication, number> = {
@@ -186,7 +210,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   private readonly groups = new Map<string, GroupState>()
   private readonly pendingGroupStores = new Set<ConversationGroupStore<unknown>>()
   private readonly activeTargets = new Set<string>()
+  /** Matches of the event in dispatch, kept by index; dispatch is not reentrant and reuses both arrays. */
+  private readonly matchedDefinitions: ConversationNodeDefinition[] = []
+  private readonly matchedResults: ConversationMatchResult[] = []
   private hasMore = false
+  private rebuildPending = false
   private replacePending = true
   private timelineDirty = true
 
@@ -359,27 +387,65 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
 
   /**
    * Materialize dirty Contexts and advance every active view builder.
+   * When an incremental update throws, the assembler replays the complete loaded
+   * window into new Contexts and replaces every active view before it throws a
+   * {@link ConversationUpdateError}. A Definition that throws on every incremental
+   * update therefore makes each flush replay the whole window. A failure on the
+   * complete-replacement path propagates unchanged, publishes no view, and keeps
+   * the replacement pending for the next flush.
    * @returns whether any view snapshot was rebuilt or incrementally applied.
+   * @throws {@link ConversationUpdateError} when an incremental update fails.
    */
   flush(): boolean {
+    if (this.rebuildPending) this.rebuildWindow()
     if (!this.replacePending && this.dirty.size === 0 && !this.timelineDirty) return false
-    if (this.replacePending) {
-      this.replaceLocationData()
-      const updated: ViewState[] = []
-      const changedTurns = this.locationIndex.takeChangedTurns()
-      for (const target of this.activeTargets) {
-        const view = this.views.get(target)
-        if (view === undefined) continue
-        this.updateView(view, true, this.buildTargetNodes(target, this.contextsByTarget.get(target)), changedTurns)
-        updated.push(view)
-      }
-      this.replacePending = false
-      this.dirty.clear()
-      this.dirtyByTarget.clear()
-      this.timelineDirty = false
-      return this.publishViews(updated)
-    }
+    if (this.replacePending) return this.flushReplacement()
 
+    try {
+      return this.flushIncremental()
+    } catch (error: unknown) {
+      return this.recoverIncremental(error)
+    }
+  }
+
+  private flushReplacement(): boolean {
+    this.replaceLocationData()
+    const updated: ViewState[] = []
+    const changedTurns = this.locationIndex.takeChangedTurns()
+    for (const target of this.activeTargets) {
+      const view = this.views.get(target)
+      if (view === undefined) continue
+      this.updateView(view, true, this.buildTargetNodes(target, this.contextsByTarget.get(target)), changedTurns)
+      updated.push(view)
+    }
+    this.replacePending = false
+    this.dirty.clear()
+    this.dirtyByTarget.clear()
+    this.timelineDirty = false
+    return this.publishViews(updated)
+  }
+
+  /** Replace partial incremental state with a complete rebuild, then report the original failure. */
+  private recoverIncremental(error: unknown): never {
+    try {
+      this.rebuildWindow()
+      this.flushReplacement()
+    } catch (recoveryError: unknown) {
+      throw new ConversationUpdateError(false, {
+        cause: new AggregateError([error, recoveryError], 'conversation update and its rebuild failed'),
+      })
+    }
+    throw new ConversationUpdateError(true, { cause: error })
+  }
+
+  /** Rebuild every Context from the loaded inputs; a failed rebuild stays pending for the next flush. */
+  private rebuildWindow(): void {
+    this.rebuildPending = true
+    this.replaceWindow(this.sortedInputs(), this.hasMore)
+    this.rebuildPending = false
+  }
+
+  private flushIncremental(): boolean {
     const updated: ViewState[] = []
     if (this.applyDirtyLocationData()) this.timelineDirty = true
     const changedTurns = this.locationIndex.takeChangedTurns()
@@ -402,7 +468,8 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
 
   /**
    * Add one target to the monotonic active set and materialize its current snapshot.
-   * Pending Context work is flushed before the first complete replacement.
+   * Pending Context work is flushed before the first complete replacement. When that
+   * flush throws, the target stays inactive and a later activation retries it.
    * @param target - registered or subsequently registered view target.
    * @returns whether any active target snapshot changed.
    */
@@ -493,36 +560,57 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
         ? startMatch ??= conversationMatch(input, role, location)
         : updateMatch ??= conversationMatch(input, role, location)
     }
-    let firstTarget: string | undefined
-    let secondTarget: string | undefined
-    let otherTargets: Set<string> | undefined
-    let publication: ConversationPublication = 'none'
+    const definitions = this.matchedDefinitions
+    const results = this.matchedResults
+    definitions.length = 0
+    results.length = 0
     const routes = this.eventDefinitions.forEvent?.(event.type)
     if (routes === undefined) {
       for (const definition of this.eventDefinitions.entries()) {
         const result = definition.match(event)
         if (result === null) continue
-        // Inline target tracking avoids an additional closure allocation for each event.
-        /* jscpd:ignore-start */
-        if (definition.target !== undefined && definition.target !== firstTarget && definition.target !== secondTarget) {
-          if (firstTarget === undefined) firstTarget = definition.target
-          else if (secondTarget === undefined) secondTarget = definition.target
-          else (otherTargets ??= new Set()).add(definition.target)
-        }
-        publication = maximumPublication(publication, accept.call(this, definition, result.id, matchFor(result.role)))
-        /* jscpd:ignore-end */
+        definitions.push(definition)
+        results.push(result)
       }
     } else {
       for (const { definition, match } of routes) {
         const result = match(event)
         if (result === null) continue
-        if (definition.target !== undefined && definition.target !== firstTarget && definition.target !== secondTarget) {
-          if (firstTarget === undefined) firstTarget = definition.target
-          else if (secondTarget === undefined) secondTarget = definition.target
-          else (otherTargets ??= new Set()).add(definition.target)
-        }
-        publication = maximumPublication(publication, accept.call(this, definition, result.id, matchFor(result.role)))
+        definitions.push(definition)
+        results.push(result)
       }
+    }
+    // Claims are resolved before any acceptance, so the outcome does not depend on registration order.
+    let claims: Map<string, string> | undefined
+    for (let index = 0; index < results.length; index++) {
+      if ((results[index] as ConversationMatchResult).exclusive !== true) continue
+      const definition = definitions[index] as ConversationNodeDefinition
+      const target = definition.target
+      if (target === undefined) {
+        throw new Error(`conversation Definition "${definition.kind}" claims ${event.type} at seq ${String(event.seq)} without a target`)
+      }
+      const claimant = claims?.get(target)
+      if (claimant !== undefined) {
+        throw new Error(`conversation Definitions "${claimant}" and "${definition.kind}" both claim ${event.type} at seq ${String(event.seq)} on target "${target}"`)
+      }
+      (claims ??= new Map()).set(target, definition.kind)
+    }
+    let firstTarget: string | undefined
+    let secondTarget: string | undefined
+    let otherTargets: Set<string> | undefined
+    let publication: ConversationPublication = 'none'
+    for (let index = 0; index < results.length; index++) {
+      const definition = definitions[index] as ConversationNodeDefinition
+      const result = results[index] as ConversationMatchResult
+      const target = definition.target
+      if (target !== undefined && result.exclusive !== true && claims?.has(target) === true) continue
+      // Inline target tracking avoids an additional closure allocation for each event.
+      if (target !== undefined && target !== firstTarget && target !== secondTarget) {
+        if (firstTarget === undefined) firstTarget = target
+        else if (secondTarget === undefined) secondTarget = target
+        else (otherTargets ??= new Set()).add(target)
+      }
+      publication = maximumPublication(publication, accept.call(this, definition, result.id, matchFor(result.role)))
     }
     const fallback = this.eventDefinitions.fallbackEntry()
     const target = fallback?.target

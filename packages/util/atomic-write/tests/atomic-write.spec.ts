@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile 
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { withFileLock, writeFileAtomic } from '../src/index.ts'
+import { FileLockError, withFileLock, writeFileAtomic } from '../src/index.ts'
 
 const state = vi.hoisted(() => ({
   afterClaim: undefined as ((claim: string) => Promise<void>) | undefined,
@@ -122,6 +122,13 @@ async function waitForLock(lockPath: string): Promise<void> {
 }
 
 describe('writeFileAtomic', () => {
+  it('preserves non-UTF-8 binary content during atomic replacement', async () => {
+    const path = join(await scratch(), 'native-helper')
+    const bytes = new Uint8Array([0, 255, 128, 0xcf, 0xfa, 0xed, 0xfe])
+    await writeFileAtomic(path, bytes, { mode: 0o700 })
+    expect(await readFile(path)).toEqual(Buffer.from(bytes))
+  })
+
   it('creates the file and its parents with exactly the stated mode', async () => {
     const dir = await scratch()
     const target = join(dir, 'nested', 'deep', 'doc.yaml')
@@ -213,6 +220,26 @@ describe('writeFileAtomic', () => {
 })
 
 describe('withFileLock', () => {
+  it('cancels a waiting writer without releasing the current holder', async () => {
+    const target = join(await scratch(), 'document')
+    const release: PromiseWithResolvers<void> = Promise.withResolvers()
+    const entered: PromiseWithResolvers<void> = Promise.withResolvers()
+    const holder = withFileLock(target, async () => { entered.resolve(); await release.promise })
+    await entered.promise
+    const controller = new AbortController()
+    const operation = vi.fn(async () => {})
+    try {
+      const waiter = withFileLock(target, operation, { waitMs: 10_000, signal: controller.signal })
+      const rejected = expect(waiter).rejects.toThrow()
+      controller.abort()
+      await rejected
+      expect(operation).not.toHaveBeenCalled()
+      expect(await readFile(`${target}.lock`, 'utf8')).toBe(record(process.pid))
+      await expect(withFileLock(target, operation, { signal: controller.signal })).rejects.toThrow()
+    } finally { release.resolve(); await holder }
+    await expect(stat(`${target}.lock`)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('retries EPERM only when the lock path currently exists', async () => {
     const dir = await scratch()
     const target = join(dir, 'document')
@@ -322,7 +349,10 @@ describe('withFileLock', () => {
     await writeFile(`${target}.lock`, held)
     const operation = vi.fn(async () => {})
 
-    await expect(withFileLock(target, operation, { waitMs: 50 })).rejects.toThrow(/timed out waiting for the writer lock/)
+    const waiting = withFileLock(target, operation, { waitMs: 50 })
+    await expect(waiting).rejects.toThrow(/timed out waiting for the writer lock/)
+    await expect(waiting).rejects.toBeInstanceOf(FileLockError)
+    await expect(waiting).rejects.toMatchObject({ name: 'FileLockError', code: 'FILE_LOCK_TIMEOUT', lockPath: `${target}.lock` })
     expect(operation).not.toHaveBeenCalled()
     expect(await readFile(`${target}.lock`, 'utf8')).toBe(held)
   })

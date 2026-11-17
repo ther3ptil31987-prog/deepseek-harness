@@ -2,8 +2,8 @@
 // The built-bundle boot smoke: the assembled-jsdom test that owns the boot
 // graph itself. Other files share the same scaffolding (assembled-boot.ts) to
 // reach a surface only the built bundles expose; this one asserts that the
-// graph assembles at all — staged activation across the immediately tier and
-// the inject layers, per-plugin CSS injection, and a rendered journey reaching
+// graph assembles at all — activation across the immediately tier and
+// the inject layers, renderer-owned module styles, and a rendered journey reaching
 // chat content from the keyless RemoteMock scenario.
 //
 // Component behavior remains owned by per-package suites (SlotTestRuntime
@@ -97,6 +97,8 @@ it('boots the built plugin graph and renders a fixture session end to end', asyn
   fireEvent.click(waitingTitle)
   await waitFor(() => {
     expect(document.querySelector('[data-sample="bash"]')).not.toBeNull()
+    expect(document.querySelector('[data-chat-running]')?.parentElement?.getAttribute('data-slot'))
+      .toBe('conversation.chat.flow')
   }, { timeout: 10_000 })
   // The generated bundle roster mounts the question UI before the approval UI.
   // Skip the resident fixture's three questions, then resolve its approval so

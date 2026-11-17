@@ -6,7 +6,7 @@
 
 import { describe, expect, onTestFinished, vi } from 'vitest'
 import { RemoteStreamCarrierError, type ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
-import { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { frames, openStream, type RemoteMock, type StreamScript } from '@deepseek-ai/dsh-remote-mock'
 import { createClientTest, type TestClient, webApp } from '@deepseek-ai/dsh-client-test-runtime/src/assembly/index.ts'
@@ -20,6 +20,7 @@ import {
 } from '../src/client/index.ts'
 import type { WorkspaceFollowFrame, WorkspaceId } from '../src/types.ts'
 import { FOLLOW, baseline, err, followGenerations, workspace, workspaceWorld } from './remote/workspace.client.ts'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const SELF = '@deepseek-ai/dsh-api-workspace-controller'
 /** The plugin as the web bundle composes it: itself plus the Gateway client, the Connection, and the Typert registry. */
@@ -32,7 +33,7 @@ const it = createClientTest({ roster: API_ROSTER })
 const COLD_BOOT_TIMEOUT_MS = 60_000
 
 const wid = (id: string): WorkspaceId => id as WorkspaceId
-const sid = (id: string): SessionId => SessionId(id)
+const sid = (id: string): SessionId => brandString<SessionId>(id)
 
 /** Boot the plugin with `follow` answering its state stream. */
 async function pluginClient(mock: RemoteMock, start: () => Promise<TestClient>, follow: StreamScript): Promise<TestClient> {
@@ -181,6 +182,38 @@ describe('Workspace state stream', () => {
     expect(replacePinned).toHaveBeenCalledWith(['session-two'])
     await stream.dispose()
     expect(streamStates(mock)).toEqual(['cancelled'])
+  })
+
+  it('applies a replace increment in place, so a Workspace hidden and shown again never errors or reconnects', async ({ mock, start }) => {
+    const { remote } = await gatewayClient(mock, start)
+    mock.stream(FOLLOW, openStream([baseline('one', 'two')]))
+    const model = new ClientWorkspaceModel(remote.workspace)
+    const carrierFailed = vi.fn(() => { model.handleCarrierFailure() })
+    const failed = vi.fn((error: unknown) => { model.handleStreamFailure(error) })
+    const stream = createWorkspaceStateStream(remote, { accept: model, carrierFailed, failed })
+    const states = new Set<string>()
+    model.subscribe(() => { states.add(model.getSnapshot().state) })
+    const ids = (): string[] => model.getSnapshot().items.map(item => item.workspaceId).sort()
+    const replace = (...workspaceIds: string[]): WorkspaceFollowFrame => ({ type: 'replace', value: baseline(...workspaceIds).value })
+
+    stream.start()
+    await vi.waitFor(() => { expect(ids()).toEqual(['one', 'two']) })
+    // Access to `two` is revoked, restored through a replace, revoked again, and restored through an upsert.
+    mock.streams.push(FOLLOW, replace('one'))
+    await vi.waitFor(() => { expect(ids()).toEqual(['one']) })
+    mock.streams.push(FOLLOW, replace('one', 'two'))
+    await vi.waitFor(() => { expect(ids()).toEqual(['one', 'two']) })
+    mock.streams.push(FOLLOW, replace('one'))
+    await vi.waitFor(() => { expect(ids()).toEqual(['one']) })
+    mock.streams.push(FOLLOW, { type: 'upsert', workspace: workspace('two') })
+    await vi.waitFor(() => { expect(ids()).toEqual(['one', 'two']) })
+
+    expect(states).not.toContain('error')
+    expect(model.getSnapshot()).toMatchObject({ phase: 'ready', state: 'idle', error: null })
+    expect(carrierFailed).not.toHaveBeenCalled()
+    expect(failed).not.toHaveBeenCalled()
+    expect(streamStates(mock)).toEqual(['open'])
+    await stream.dispose()
   })
 
   it('retains the old state across carrier loss and applies the replacement baseline', async ({ mock, start }) => {

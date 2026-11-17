@@ -5,8 +5,7 @@ import { dirname, extname, isAbsolute, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
-import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
-import { load } from 'js-yaml'
+import { applyEntryPatches, parseEntryYaml, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { resolvePluginResource } from './package-meta.ts'
 import { barePackageName } from './profile-resolution/resolver.ts'
 import type {} from './profile-resolution/service.ts'
@@ -105,10 +104,10 @@ function preflight(
       const issue = evaluatePluginCompatibility(manifest, exemptions)
       return issue === undefined || issue.exempted ? undefined : pluginCompatibilityWarning(issue)
     } catch (error) {
-      // Peer metadata that cannot be read or validated is refused rather than silently admitted.
+      // Requirement metadata that cannot be read or validated is refused rather than silently admitted.
       /* v8 ignore next -- every reader and parser used here rejects with an Error. */
       const detail = error instanceof Error ? error.message : String(error)
-      return `its declared peer dependencies cannot be validated: ${detail}`
+      return `its declared dsh requirements cannot be validated: ${detail}`
     }
   }
   const deny = (row: EntryOptions, reason: string): void => {
@@ -151,7 +150,7 @@ function preflight(
     includes.add(filename)
     try {
       let data: unknown
-      try { data = load(readFileSync(filename, 'utf8'), { schema: entryListSchema }) }
+      try { data = parseEntryYaml(readFileSync(filename, 'utf8')) }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || config.initial === undefined) return undefined
         data = config.initial

@@ -9,6 +9,9 @@
   ],
   "references": [
     {
+      "path": "../../util/brand"
+    },
+    {
       "path": "../../../vendor/cosmokit"
     },
     {
@@ -45,9 +48,6 @@
       "path": "../../llm/token-meter"
     },
     {
-      "path": "../../session/session-projection"
-    },
-    {
       "path": "../../storage/storage-domain"
     },
     {
@@ -61,6 +61,12 @@
     },
     {
       "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../session/working-directory"
+    },
+    {
+      "path": "../../util/error"
     }
   ]
 }

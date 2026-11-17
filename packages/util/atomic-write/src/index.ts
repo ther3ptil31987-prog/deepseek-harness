@@ -1,5 +1,5 @@
 /**
- * Zero-dependency atomic file replacement and writer coordination.
+ * Atomic file replacement and writer coordination.
  * `writeFileAtomic` writes a random-suffix sibling with exclusive create and
  * the caller's permission bits, then renames it over the target, so readers
  * observe either the old or the new complete content and a replaced file ends
@@ -14,6 +14,8 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { setTimeout as wait } from 'node:timers/promises'
+import { HarnessError } from '@deepseek-ai/dsh-error'
 
 const WINDOWS_TRANSIENT_RENAME_ERRORS: ReadonlySet<string> = new Set(['EACCES', 'EBUSY', 'EPERM'])
 const WINDOWS_RENAME_RETRY_INITIAL_MS = 20
@@ -76,7 +78,7 @@ export interface WriteFileAtomicOptions {
  * @param content - complete next file content.
  * @param options - permission bits for the replacement inode.
  */
-export async function writeFileAtomic(filename: string, content: string, options: WriteFileAtomicOptions): Promise<void> {
+export async function writeFileAtomic(filename: string, content: string | Uint8Array, options: WriteFileAtomicOptions): Promise<void> {
   await mkdir(dirname(filename), {
     recursive: true,
     ...options.dirMode === undefined ? {} : { mode: options.dirMode },
@@ -197,6 +199,8 @@ const DEFAULT_LOCK_WAIT_MS = 2_000
 
 /** Options for one {@link withFileLock} acquisition. */
 export interface FileLockOptions {
+  /** Cancel acquisition and contention waits; the operation owns cancellation after it starts. */
+  signal?: AbortSignal
   /**
    * Maximum time to wait for the lock, in milliseconds. State one when the
    * holder's operation legitimately runs longer than file work — a credential
@@ -206,6 +210,24 @@ export interface FileLockOptions {
    * contender that acquires the lock afterwards re-reads the committed state.
    */
   waitMs?: number
+}
+
+/**
+ * A {@link withFileLock} acquisition failure. `FILE_LOCK_TIMEOUT`: another
+ * writer still held the lock at the wait deadline and the operation did not
+ * start, so the caller may retry after that writer finishes.
+ */
+export class FileLockError extends HarnessError {
+  override readonly code: 'FILE_LOCK_TIMEOUT'
+  /** The contended `<filename>.lock` path. */
+  readonly lockPath: string
+
+  constructor(lockPath: string) {
+    super(`atomic-write: timed out waiting for the writer lock at ${lockPath}`, 'FILE_LOCK_TIMEOUT')
+    this.name = 'FileLockError'
+    this.code = 'FILE_LOCK_TIMEOUT'
+    this.lockPath = lockPath
+  }
 }
 
 /**
@@ -231,6 +253,7 @@ export interface FileLockOptions {
  * @param operation - the read-render-commit cycle to run while holding the lock.
  * @param options - acquisition options; omitted waits {@link DEFAULT_LOCK_WAIT_MS}.
  * @returns the operation's result; the lock releases on both outcomes.
+ * @throws {FileLockError} `FILE_LOCK_TIMEOUT` when the lock is still held at the deadline.
  */
 export async function withFileLock<T>(
   filename: string,
@@ -242,6 +265,7 @@ export async function withFileLock<T>(
   let delay = LOCK_RETRY_INITIAL_MS
   let retriedUnconfirmedPermissionError = false
   for (;;) {
+    options?.signal?.throwIfAborted()
     try {
       await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
       break
@@ -255,12 +279,13 @@ export async function withFileLock<T>(
       } else if (await takeOverExitedLock(lockPath)) continue
     }
     if (Date.now() >= deadline) {
-      throw new Error(`atomic-write: timed out waiting for the writer lock at ${lockPath}`)
+      throw new FileLockError(lockPath)
     }
-    await new Promise(resolve => setTimeout(resolve, delay))
+    await wait(delay, undefined, { signal: options?.signal })
     delay = Math.min(delay * 2, LOCK_RETRY_MAX_MS)
   }
   try {
+    options?.signal?.throwIfAborted()
     return await operation()
   } finally {
     await rm(lockPath, { force: true })
